@@ -7,7 +7,7 @@
 %%% Created : 26. Aug 2018 15:58
 %%%-------------------------------------------------------------------
 -module(yr).
--author("GaS").
+-export([start/0]).
 
-%% API
--export([]).
+start() ->
+    application:ensure_all_started(?MODULE).

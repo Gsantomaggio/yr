@@ -66,8 +66,8 @@ init([]) ->
     Shutdown = 2000,
     Type = worker,
 
-    AChild = {'AName', {'AModule', start_link, []},
-        Restart, Shutdown, Type, ['AModule']},
+    AChild = {yr_reg, {yr_reg, start_link, []},
+        Restart, Shutdown, Type, [yr_reg]},
 
     {ok, {SupFlags, [AChild]}}.
 

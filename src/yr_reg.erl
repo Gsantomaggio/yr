@@ -17,20 +17,33 @@
 %% gen_statem callbacks
 -export([
     init/1,
-    format_status/2,
-    state_name/3,
     handle_event/4,
     terminate/3,
     code_change/4
-]).
+    , callback_mode/0, register/2, whereis/1, unregister/1, processes/0]).
 
 -define(SERVER, ?MODULE).
 
--record(state, {}).
+-include_lib("stdlib/include/ms_transform.hrl").
+-record(state, {reg_table, ps_table}).
 
 %%%===================================================================
 %%% API
 %%%===================================================================
+
+register(Atom, PID) ->
+    gen_statem:call(?SERVER, {register, Atom, PID}).
+
+unregister(Atom) ->
+    gen_statem:call(?SERVER, {unregister, Atom}).
+
+
+whereis(Atom) ->
+    gen_statem:call(?SERVER, {whereis, Atom}).
+
+
+processes() ->
+    gen_statem:call(?SERVER, {processes}).
 
 %%--------------------------------------------------------------------
 %% @doc
@@ -62,102 +75,58 @@ start_link() ->
 %% @end
 %%--------------------------------------------------------------------
 init([]) ->
-    {ok, state_name, #state{}}.
+    {ok, lazy_init, #state{}}.
 
-%%--------------------------------------------------------------------
-%% @private
-%% @doc
-%% Called (1) whenever sys:get_status/1,2 is called by gen_statem or
-%% (2) when gen_statem terminates abnormally.
-%% This callback is optional.
-%%
-%% @spec format_status(Opt, [PDict, StateName, State]) -> term()
-%% @end
-%%--------------------------------------------------------------------
-format_status(_Opt, [_PDict, _StateName, _State]) ->
-    Status = some_term,
-    Status.
 
-%%--------------------------------------------------------------------
-%% @private
-%% @doc
-%% There should be one instance of this function for each possible
-%% state name.  If callback_mode is statefunctions, one of these
-%% functions is called when gen_statem receives and event from
-%% call/2, cast/2, or as a normal process message.
-%%
-%% @spec state_name(Event, From, State) ->
-%%                   {next_state, NextStateName, NextState} |
-%%                   {next_state, NextStateName, NextState, Actions} |
-%%                   {stop, Reason, NewState} |
-%%    				 stop |
-%%                   {stop, Reason :: term()} |
-%%                   {stop, Reason :: term(), NewData :: data()} |
-%%                   {stop_and_reply, Reason, Replies} |
-%%                   {stop_and_reply, Reason, Replies, NewState} |
-%%                   {keep_state, NewData :: data()} |
-%%                   {keep_state, NewState, Actions} |
-%%                   keep_state_and_data |
-%%                   {keep_state_and_data, Actions}
-%% @end
-%%--------------------------------------------------------------------
-state_name(_EventType, _EventContent, State) ->
-    NextStateName = next_state,
-    {next_state, NextStateName, State}.
+callback_mode() ->
+    handle_event_function.
 
-%%--------------------------------------------------------------------
-%% @private
-%% @doc
-%%
-%% If callback_mode is handle_event_function, then whenever a
-%% gen_statem receives an event from call/2, cast/2, or as a normal
-%% process message, this function is called.
-%%
-%% @spec handle_event(Event, StateName, State) ->
-%%                   {next_state, NextStateName, NextState} |
-%%                   {next_state, NextStateName, NextState, Actions} |
-%%                   {stop, Reason, NewState} |
-%%    				 stop |
-%%                   {stop, Reason :: term()} |
-%%                   {stop, Reason :: term(), NewData :: data()} |
-%%                   {stop_and_reply, Reason, Replies} |
-%%                   {stop_and_reply, Reason, Replies, NewState} |
-%%                   {keep_state, NewData :: data()} |
-%%                   {keep_state, NewState, Actions} |
-%%                   keep_state_and_data |
-%%                   {keep_state_and_data, Actions}
-%% @end
-%%--------------------------------------------------------------------
-handle_event(_EventType, _EventContent, _StateName, State) ->
-    NextStateName = the_next_state_name,
-    {next_state, NextStateName, State}.
 
-%%--------------------------------------------------------------------
-%% @private
-%% @doc
-%% This function is called by a gen_statem when it is about to
-%% terminate. It should be the opposite of Module:init/1 and do any
-%% necessary cleaning up. When it returns, the gen_statem terminates with
-%% Reason. The return value is ignored.
-%%
-%% @spec terminate(Reason, StateName, State) -> void()
-%% @end
-%%--------------------------------------------------------------------
+handle_event({call, From}, N, lazy_init, State) ->
+    T = ets:new(reg_table, [duplicate_bag, public, named_table]),
+    PS = ets:new(ps_table, [duplicate_bag, public, named_table]),
+    error_logger:info_report([{init, N}]),
+    {next_state, ready, State#state{reg_table = T, ps_table = PS},
+        [{next_event, {call, From}, N}]};
+handle_event({call, From}, {register, Atom, PID}, ready, State = #state{reg_table = T}) when is_pid(PID) ->
+    case ets:lookup(T, Atom) of
+        [] ->
+            Ref = erlang:monitor(process, PID),
+            R = ets:insert(reg_table, {Atom, PID, Ref}),
+            {keep_state, State, [{reply, From, {ok, R}}]};
+        [{_, PID_TABLE}] ->
+            error_logger:info_report([{error_report, PID_TABLE}]),
+            {keep_state, State, [{reply, From, {error, PID_TABLE}}]}
+    end;
+handle_event({call, From}, {register, _Atom, _PID}, ready, State) ->
+    {keep_state, State, [{reply, From, {error, not_valid_pid}}]};
+
+handle_event({call, From}, {unregister, Atom}, ready, State = #state{reg_table = T}) ->
+    case ets:lookup(T, Atom) of
+        [] ->
+            {keep_state, State, [{reply, From, {error, Atom}}]};
+        [{_, PID_TABLE, Ref}] ->
+            erlang:demonitor(Ref, [flush]),
+            ets:delete(T, Atom),
+            {keep_state, State, [{reply, From, {ok, PID_TABLE}}]}
+    end;
+handle_event({call, From}, {whereis, Atom}, ready, State) ->
+    case ets:lookup(reg_table, Atom) of
+        [] -> {keep_state, State, [{reply, From, {error, Atom}}]};
+        [{_, PID_TABLE, _}] ->
+            {keep_state, State, [{reply, From, PID_TABLE}]}
+    end;
+handle_event({call, From}, {processes}, ready, State = #state{reg_table = T}) ->
+    {keep_state, State, [{reply, From, {ok, ets:select(T, ets:fun2ms(fun(N) -> N end))}}]};
+handle_event(info, {'DOWN', _MonitorReference, process, Pid, Reason}, ready, State = #state{reg_table = T}) ->
+    error_logger:info_report([{down, Pid}, {reason, Reason}]),
+    [{Atm, Rf}] = ets:select(T, ets:fun2ms(fun({Atom, PidL, Ref}) when PidL =:= Pid -> {Atom, Ref} end)),
+    erlang:demonitor(Rf, [flush]),
+    ets:delete(T, Atm),
+    {keep_state, State, []}.
+
 terminate(_Reason, _StateName, _State) ->
     ok.
 
-%%--------------------------------------------------------------------
-%% @private
-%% @doc
-%% Convert process state when code is changed
-%%
-%% @spec code_change(OldVsn, StateName, State, Extra) ->
-%%                   {ok, StateName, NewState}
-%% @end
-%%--------------------------------------------------------------------
 code_change(_OldVsn, StateName, State, _Extra) ->
     {ok, StateName, State}.
-
-%%%===================================================================
-%%% Internal functions
-%%%===================================================================
